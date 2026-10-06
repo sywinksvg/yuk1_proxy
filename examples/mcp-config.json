@@ -1,0 +1,50 @@
+{
+  "_说明": "把 <SERVER_DIR> 换成你解压后 server 目录的绝对路径，例如 C:\\\\tools\\\\yuk1_proxy\\\\server",
+  "_推荐": "command 用 uv 的绝对路径（where uv 查），避免客户端找不到 PATH",
+
+  "zcode_or_yucode": {
+    "_位置": "编辑 ~/.zcode/cli/config.json，把下面这条加进 mcp.servers 里",
+    "mcp": {
+      "servers": {
+        "yuk1_proxy": {
+          "command": "uv",
+          "args": ["run", "--directory", "<SERVER_DIR>", "python", "mcp_yuk1_proxy.py"]
+        }
+      }
+    }
+  },
+
+  "claude_desktop": {
+    "_位置": "Windows: %APPDATA%\\Claude\\claude_desktop_config.json / macOS: ~/Library/Application Support/Claude/claude_desktop_config.json",
+    "mcpServers": {
+      "yuk1_proxy": {
+        "command": "uv",
+        "args": ["run", "--directory", "<SERVER_DIR>", "python", "mcp_yuk1_proxy.py"]
+      }
+    }
+  },
+
+  "带环境变量": {
+    "_说明": "自定义数据目录；要启用 nps 高级源则加 YUK1_PROXY_ENABLE_NPS",
+    "mcpServers": {
+      "yuk1_proxy": {
+        "command": "uv",
+        "args": ["run", "--directory", "<SERVER_DIR>", "python", "mcp_yuk1_proxy.py"],
+        "env": {
+          "YUK1_PROXY_DATA": "D:\\yuk1_proxy-data",
+          "YUK1_PROXY_ENABLE_NPS": "0"
+        }
+      }
+    }
+  },
+
+  "不用uv_用venv_python": {
+    "_说明": "先在 server 目录建 .venv 并装依赖，再把 command 指向 venv 的 python",
+    "mcpServers": {
+      "yuk1_proxy": {
+        "command": "<SERVER_DIR>\\.venv\\Scripts\\python.exe",
+        "args": ["<SERVER_DIR>\\mcp_yuk1_proxy.py"]
+      }
+    }
+  }
+}

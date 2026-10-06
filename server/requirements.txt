@@ -1,0 +1,7 @@
+# yuk1_proxy —— 不想用 uv 时，用这个文件装依赖
+# 用法（在 server 目录）：
+#   python -m venv .venv
+#   .venv\Scripts\pip install -r requirements.txt        # Windows
+#   source .venv/bin/pip install -r requirements.txt     # macOS / Linux
+mcp>=1.9.0,<2
+requests[socks]>=2.31

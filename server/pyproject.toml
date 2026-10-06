@@ -1,0 +1,12 @@
+[project]
+name = "yuk1_proxy"
+version = "1.0.0"
+description = "yuk1_proxy MCP server（nps 源 / 验活 / 出枪 / 统一入口管理）"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.9.0,<2",
+    "requests[socks]>=2.31",
+]
+
+[tool.uv]
+package = false
