@@ -1,6 +1,7 @@
 {
   "_说明": "把 <SERVER_DIR> 换成你解压后 server 目录的绝对路径，例如 C:\\\\tools\\\\yuk1_proxy\\\\server",
   "_推荐": "command 用 uv 的绝对路径（where uv 查），避免客户端找不到 PATH",
+  "_通用": "MCP 接入与客户端无关：下面是几个常见客户端的「外壳」，字段名通常是 mcpServers 或 mcp.servers",
 
   "zcode_or_yucode": {
     "_位置": "编辑 ~/.zcode/cli/config.json，把下面这条加进 mcp.servers 里",
@@ -25,13 +26,15 @@
   },
 
   "带环境变量": {
-    "_说明": "自定义数据目录；要启用 nps 高级源则加 YUK1_PROXY_ENABLE_NPS",
+    "_说明": "常用 env：数据目录 / 上游代理 / 直连兜底开关 / nps 高级源（默认关）",
     "mcpServers": {
       "yuk1_proxy": {
         "command": "uv",
         "args": ["run", "--directory", "<SERVER_DIR>", "python", "mcp_yuk1_proxy.py"],
         "env": {
           "YUK1_PROXY_DATA": "D:\\yuk1_proxy-data",
+          "YUK1_PROXY_UPSTREAM": "http://127.0.0.1:7890",
+          "YUK1_PROXY_ALLOW_DIRECT": "1",
           "YUK1_PROXY_ENABLE_NPS": "0"
         }
       }

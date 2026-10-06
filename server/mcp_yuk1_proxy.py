@@ -185,6 +185,13 @@ def _fetch_core(url: str, method: str = "GET", data=None, headers=None, max_trie
             if pp.looks_blocked(r.status_code, r.text):
                 blocked.append(f"{p} -> HTTP {r.status_code}")
                 continue
+            if pp.is_target_error(r.status_code):
+                # 目标侧故障（500/502/503/504）：换出口无意义，直接交还真实响应
+                return {"ok": True, "proxy": p, "status": r.status_code, "target_error": True,
+                        "note": "目标侧故障码，与出口无关：已停止轮转（换出口不会改善）",
+                        "elapsed": round(time.time() - t0, 2),
+                        "headers": dict(list(r.headers.items())[:12]),
+                        "body_head": r.text[:800], "tried": tried, "blocked_by": blocked}
             pp.blacklist_clear(p)
             if len(_HOST_PREF) > 500:
                 _HOST_PREF.clear()
@@ -205,6 +212,7 @@ def yuk1_fetch(url: str, method: str = "GET", data: Optional[str] = None,
                headers: Optional[list] = None, max_tries: int = 8) -> dict:
     """从池里挑活代理直接出枪（进程内轮转，不经 10001）。WAF 感知：403/429/验证码页
     等拦截响应自动换出口重试；同一目标优先复用上次可用出口；单轮内同一代理 ≤3 枪。
+    目标侧故障码（500/502/503/504）不换出口，直接返回并带 target_error=true。
     返回所用代理、状态码、响应头与 body 头部（≤800 字符）；失败返回尝试/被拦清单。"""
     return _fetch_core(url, method, data, headers, max_tries)
 

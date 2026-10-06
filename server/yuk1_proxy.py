@@ -47,6 +47,13 @@ nps 源（2026-10-05 新增 · CVE-2022-40494 · 补国内 IP）：
   3. check 用首页/静态资源轻验证，别拿重口打验证
   4. **先判防护类型再换出口**：频率防护（整站 000、几十秒自愈）降频即可，
      换代理反而更糟（代理 IP 信誉差）；只有 IP 级封禁才需要换出口
+
+环境变量：
+  YUK1_PROXY_DATA         数据目录（默认 ~/.yuk1_proxy/data）
+  YUK1_PROXY_UPSTREAM     本地上游代理（GitHub 类源用；默认自动探测常见端口，无则直连）
+  YUK1_PROXY_ALLOW_DIRECT 池空时是否允许直连兜底（默认 1；置 0 → 回 502 不漏本机 IP）
+  YUK1_PROXY_ENABLE_NPS   启用 nps 采集源（默认关，高级源，见 README）
+  YUK1_PROXY_FOFA_Q       fofa_q.py 位置（nps 源需要，本包不含）
 """
 import argparse
 import concurrent.futures as cf
@@ -67,6 +74,8 @@ import warnings
 from pathlib import Path
 
 import requests
+
+__version__ = "1.1.0"
 
 HOME = Path.home()
 # 数据目录：env YUK1_PROXY_DATA 优先（客户端 env 注入），默认 ~/.yuk1_proxy/data
@@ -123,7 +132,40 @@ SOURCES_CN = [
     "https://cdn.jsdelivr.net/gh/proxy4parsing/proxy-list@main/http.txt",
     "https://gh-proxy.com/https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
 ]
-CLASH = {"http": "http://127.0.0.1:7897", "https": "http://127.0.0.1:7897"}
+# ── 需要梯子的源（GitHub / jsdelivr 等）走的本地上游代理 ──
+# 以前这里写死 7897，本机没开 Clash 就整组源静默失败。现在：
+#   env YUK1_PROXY_UPSTREAM 优先（如 http://127.0.0.1:7890）；
+#   否则探测常见本地代理端口；都没有 → 那些源改走直连（很多网络本就能直连 GitHub）。
+UPSTREAM_ENV = os.environ.get("YUK1_PROXY_UPSTREAM", "").strip()
+UPSTREAM_PORTS = (7897, 7890, 10809, 10808, 2080, 7891, 20171)
+_UPSTREAM_CACHE = {"v": "unset"}   # "unset" / None / "http://127.0.0.1:PORT"
+
+
+def upstream_proxy():
+    """返回本地上游代理 URL（'http://127.0.0.1:PORT'）或 None（None=没有可用上游）。
+    结果缓存：探测一次，之后不再重试（端口不会中途冒出来）。"""
+    if _UPSTREAM_CACHE["v"] != "unset":
+        return _UPSTREAM_CACHE["v"]
+    val = None
+    if UPSTREAM_ENV:
+        val = UPSTREAM_ENV if "://" in UPSTREAM_ENV else f"http://{UPSTREAM_ENV}"
+    else:
+        for port in UPSTREAM_PORTS:
+            try:
+                s = socket.create_connection(("127.0.0.1", port), timeout=0.3)
+                s.close()
+                val = f"http://127.0.0.1:{port}"
+                break
+            except Exception:
+                continue
+    _UPSTREAM_CACHE["v"] = val
+    return val
+
+
+# 直连兜底开关：池空/全挂时是否允许用本机 IP 直连（保入口永不失效，但会漏本机 IP）。
+# env YUK1_PROXY_ALLOW_DIRECT=0 关闭 → 此时返回 502，宁可失败也不露 IP。
+ALLOW_DIRECT = os.environ.get("YUK1_PROXY_ALLOW_DIRECT", "1").strip().lower() not in ("0", "false", "no")
+
 UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
@@ -134,13 +176,16 @@ UA = UA_POOL[0]   # 兼容旧引用（shoot 等固定头）
 
 
 def _session(direct=True):
-    """独立会话：direct=True 不读系统代理（绝不干扰本机 Clash）；False 显式走 7897。
+    """独立会话：direct=True 不读系统代理（绝不干扰本机 Clash）；False 显式走本地上游代理
+    （没探测到上游就自动退回直连，不再像以前那样静默失败）。
     UA 每次随机（降低固定指纹，对 WAF 与留痕都友好）。"""
     s = requests.Session()
     s.trust_env = False
     s.headers.update({"User-Agent": random.choice(UA_POOL)})
     if not direct:
-        s.proxies.update(CLASH)
+        up = upstream_proxy()
+        if up:
+            s.proxies.update({"http": up, "https": up})
     return s
 
 
@@ -215,14 +260,20 @@ def fetch_sources(limit_each=300, cn_only=False):
     POOL_DIR.mkdir(parents=True, exist_ok=True)
     sources = SOURCES_CN if cn_only else (SOURCES_CN + SOURCES_DIRECT + SOURCES_GITHUB)
     seen, out, dead = set(), [], 0
+    no_up_warned = [False]
     for src in sources:
-        use_clash = ("githubusercontent" in src) or ("gh-proxy" in src) or ("jsdelivr" in src)
+        needs_up = ("githubusercontent" in src) or ("gh-proxy" in src) or ("jsdelivr" in src)
+        up = upstream_proxy() if needs_up else None
         try:
-            r = _session(direct=not use_clash).get(src, timeout=(4, 12))
+            r = _session(direct=not needs_up).get(src, timeout=(4, 12))
             rows = _parse_lines(r.text, src)
         except Exception as e:
             dead += 1
-            tag = "Clash/中转" if use_clash else "直连"
+            if needs_up and not up and not no_up_warned[0]:
+                no_up_warned[0] = True
+                print("[!] 有源需要梯子但没探测到本地代理端口（已按直连重试）。"
+                      "要启用请设 YUK1_PROXY_UPSTREAM=http://127.0.0.1:<端口>", flush=True)
+            tag = ("上游" if up else "直连") if needs_up else "直连"
             print(f"[-] {src.split('/')[2][:40]} ({tag}): {type(e).__name__}", flush=True)
             continue
         got = 0
@@ -326,7 +377,13 @@ def filter_pool(pool):
 
 
 # ── WAF/拦截判定（出枪自动换出口用）──
-BLOCK_STATUS = {403, 405, 406, 418, 420, 429, 503}
+# 只收「换出口有意义」的码：403/406/418/420 是 WAF 与风控的典型应答，429 是限流。
+# 明确排除：
+#   405 Method Not Allowed —— 服务端在正常回答「方法不对」，换出口没用，改方法才有用；
+#   500/502/503/504        —— 目标侧故障，与出口无关，换出口只会白烧代理。
+BLOCK_STATUS = {403, 406, 418, 420, 429}
+# 目标侧故障码：见到就停手报错，别拿代理池去刷
+TARGET_ERR_STATUS = {500, 502, 503, 504}
 BLOCK_MARKS = ("拦截", "封禁", "禁止访问", "访问受限", "access denied", "blocked",
                "web application firewall", "captcha", "验证码", "人机验证")
 
@@ -339,6 +396,11 @@ def looks_blocked(status, text=""):
     return any(m in t for m in BLOCK_MARKS)
 
 
+def is_target_error(status):
+    """目标侧故障（非出口问题）：换出口无意义，应直接把响应交还给调用方。"""
+    return status in TARGET_ERR_STATUS
+
+
 _DIRECT_TS = [0.0]
 
 
@@ -347,7 +409,11 @@ def _log_direct(target, extra=""):
     now = time.time()
     if now - _DIRECT_TS[0] > 10:
         _DIRECT_TS[0] = now
-        print(f"[direct] {extra}直连兜底（本机 IP）: {target}", file=sys.stderr, flush=True)
+        if ALLOW_DIRECT:
+            print(f"[direct] {extra}直连兜底（本机 IP 已暴露）: {target}", file=sys.stderr, flush=True)
+        else:
+            print(f"[direct] {extra}池内无可用出口，直连兜底已禁用 → 返回 502: {target}",
+                  file=sys.stderr, flush=True)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -616,12 +682,21 @@ def _nps_validate(ep):
     return None
 
 
+def _fofa_q_path():
+    """定位 fofa_q.py：env YUK1_PROXY_FOFA_Q 优先，否则找脚本同目录。找不到返回 None。
+    （fofa_q.py 不随本工具包分发，需自备：它负责把 FOFA 查询落到本地 JSON。）"""
+    fq_env = os.environ.get("YUK1_PROXY_FOFA_Q", "").strip()
+    fq = Path(fq_env).expanduser() if fq_env else Path(__file__).resolve().parent / "fofa_q.py"
+    return fq if fq.exists() else None
+
+
 def _fofa_pull(queries, size, tag):
     """经 fofa_q.py（FOFA 唯一合法通道）拉候选，返回 [(host, ip), ...]。"""
-    fq_env = os.environ.get("YUK1_PROXY_FOFA_Q", "").strip()
-    fq = Path(fq_env) if fq_env else Path(__file__).resolve().parent / "fofa_q.py"
-    if not fq.exists():
-        print(f"[fofa] 找不到 fofa_q.py（{fq}）：设 YUK1_PROXY_FOFA_Q 指向它，或用 --skip-fofa 复用已缓存候选")
+    fq = _fofa_q_path()
+    if fq is None:
+        print("[fofa] 找不到 fofa_q.py（本工具包不含它，需自备）。两种解法：\n"
+              "      ① 设 YUK1_PROXY_FOFA_Q=<fofa_q.py 绝对路径>\n"
+              "      ② 用 --skip-fofa 复用已落盘候选（POOL_DIR/nps_fofa_*.json）")
         return []
     rows, seen = [], set()
     for i, (q, force_body) in enumerate(queries):
@@ -670,7 +745,9 @@ def nps_harvest(fofa_size=3000, probe=200, workers=60, ep_cap=400, keep_all=Fals
     对方访问日志/防火墙只见 via 的 IP；None=直连（暴露本机 IP）。"""
     global SCAN_VIA
     if not NPS_ENABLED:
-        print("[nps] 未启用：把插件选项 enable_nps 置 1（env YUK1_PROXY_ENABLE_NPS=1）后可用；见 README 的使用边界说明")
+        print("[nps] 未启用：设 YUK1_PROXY_ENABLE_NPS=1 后可用（高级源，默认关闭）。\n"
+              "      启用前请先读 README「关于 nps 源」——该源使用的是他人服务器的出口，\n"
+              "      仅在你有明确授权的场景自行开启。")
         return []
     SCAN_VIA = via
     t0 = time.time()
@@ -872,8 +949,8 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
                 random.shuffle(tier)
                 pool.extend(tier)
             if not pool:
-                # 无可用代理（池空或全在拉黑期）：直连兜底（保证统一入口永不失效）
-                _log_direct(target)
+                # 无可用代理（池空或全在拉黑期）
+                _log_direct(target, extra="池为空，")
                 self._direct(client, head, method, target)
                 return
 
@@ -905,8 +982,8 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
                                 upstream.close()
                                 blacklist_add(proxy)
                                 continue
-                        client.sendall(("HTTP/1.1 200 Connection Established"
-                                       + self.HDR_END).encode())
+                        client.sendall(("HTTP/1.1 200 Connection Established" + self.CRLF
+                                        + "X-Yuk1-Egress: proxy" + self.HDR_END).encode())
                         blacklist_clear(proxy)
                         _tunnel_pair(client, upstream)
                         return
@@ -946,14 +1023,24 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
                         pass
                     blacklist_add(proxy)
                     continue
-            # 池内全挂：直连兜底
+            # 池内全挂
             _log_direct(target, extra=f"{tried} 个代理全挂，")
             self._direct(client, head, method, target)
         except Exception:
             pass
 
     def _direct(self, client, head, method, target):
-        """直连兜底：池空/全挂时保证请求仍能出去（不换 IP，但至少可用）。"""
+        """直连兜底：池空/全挂时保证请求仍能出去（不换 IP，但至少可用）。
+        YUK1_PROXY_ALLOW_DIRECT=0 时禁用：直接回 502，宁可失败也不漏本机 IP。
+        CONNECT 响应带 X-Yuk1-Egress: direct，调用方可据此确认「这次没走代理」。"""
+        if not ALLOW_DIRECT:
+            try:
+                client.sendall(self._resp(502, b"Bad Gateway",
+                                          extra=b"X-Yuk1-Egress: none\r\n"
+                                                b"X-Pool-Error: direct fallback disabled"))
+            except Exception:
+                pass
+            return
         try:
             import urllib.parse as _up
             m = method if isinstance(method, str) else method.decode()
@@ -961,8 +1048,8 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
                 host, _, port = target.rpartition(":")
                 up = socket.create_connection((host, int(port or 443)), timeout=15)
                 up.settimeout(30)
-                client.sendall(("HTTP/1.1 200 Connection Established"
-                                + self.HDR_END).encode())
+                client.sendall(("HTTP/1.1 200 Connection Established" + self.CRLF
+                                + "X-Yuk1-Egress: direct" + self.HDR_END).encode())
                 _tunnel_pair(client, up)
                 return
             else:
@@ -1117,16 +1204,18 @@ def serve(port=LOCAL_PORT, entry_port=10001, max_tries=6, block=True, watch=120,
     srv.max_tries = max_tries
     pool = _pool_for(entry_port)
     paid = load_file(PAID_FILE)
-    print(f"[*] 统一出口入口已启动:  http://{LOCAL_HOST}:{port}")
-    print(f"    用法:  curl -x http://{LOCAL_HOST}:{port} <目标URL>")
-    print(f"    上游池: {len(pool)} 个活代理（其中付费 {len(paid)} 个），失败自动轮转")
+    print(f"[*] 统一出口入口已启动:  http://{LOCAL_HOST}:{port}", flush=True)
+    print(f"    用法:  curl -x http://{LOCAL_HOST}:{port} <目标URL>", flush=True)
+    print(f"    上游池: {len(pool)} 个活代理（其中付费 {len(paid)} 个），失败自动轮转", flush=True)
     print(f"    存活巡检: {'每 %ds 复验池条目' % watch if watch > 0 else '关闭'}"
-          f"（via={auto_via or '直连'}）；使用期失败拉黑 {BLACK_TTL}s")
+          f"（via={auto_via or '直连'}）；使用期失败拉黑 {BLACK_TTL}s", flush=True)
+    print(f"    直连兜底: {'开（池空/全挂时用本机 IP，响应带 X-Yuk1-Egress: direct）' if ALLOW_DIRECT else '关（池空即返回 502，不漏本机 IP）'}"
+          f"  [YUK1_PROXY_ALLOW_DIRECT={'1' if ALLOW_DIRECT else '0'}]", flush=True)
     if auto_harvest > 0:
-        print(f"    自动补采: 存活<3 时跑 nps 采集 {auto_harvest} 台")
+        print(f"    自动补采: 存活<3 时跑 nps 采集 {auto_harvest} 台", flush=True)
     if not pool:
         print("[!] 池为空——先跑 check 验证："
-              f"  python yuk1_proxy.py check https://<轻量目标>/")
+              f"  python yuk1_proxy.py check https://<轻量目标>/", flush=True)
     if watch > 0:
         def _loop():
             while True:
@@ -1191,8 +1280,9 @@ def load_ok():
 
 
 def doctor(url="https://ip-api.com/json/?lang=zh-CN"):
-    """一键诊断：本机出口归属 + 池子规模 + 直连对目标连通性。"""
+    """一键诊断：本机出口归属 + 池子规模 + 入口状态 + 可选源可用性。"""
     print("=" * 60)
+    print(f"yuk1_proxy v{__version__}")
     print("[1] 本机直连出口")
     try:
         r = _session().get("http://ip-api.com/json/?lang=zh-CN", timeout=8)
@@ -1219,11 +1309,21 @@ def doctor(url="https://ip-api.com/json/?lang=zh-CN"):
     except Exception:
         print(f"    ⚠ {LOCAL_HOST}:{LOCAL_PORT} 未启动"
               f"（python yuk1_proxy.py serve --port {LOCAL_PORT}）")
+    print(f"    直连兜底: {'开（池空时用本机 IP）' if ALLOW_DIRECT else '关（池空返回 502）'}"
+          f"  [YUK1_PROXY_ALLOW_DIRECT={'1' if ALLOW_DIRECT else '0'}]")
+    print("[4] 可选源")
+    up = upstream_proxy()
+    print(f"    本地上游代理: {up or '未探测到'}"
+          f"{'' if up else '（GitHub 类源将按直连尝试；要启用设 YUK1_PROXY_UPSTREAM）'}")
+    fq = _fofa_q_path()
+    print(f"    nps 源: {'已启用' if NPS_ENABLED else '未启用（设 YUK1_PROXY_ENABLE_NPS=1）'}"
+          f"；fofa_q.py: {'✅ ' + str(fq) if fq else '❌ 未找到（nps 源不可用，设 YUK1_PROXY_FOFA_Q 指向它）'}")
     print("=" * 60)
 
 
 def main():
     ap = argparse.ArgumentParser(description="代理池 + 本地统一出口入口 127.0.0.1:10001")
+    ap.add_argument("--version", action="version", version=f"yuk1_proxy {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sv = sub.add_parser("serve", help="起本地统一出口入口（推荐）")
